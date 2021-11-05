@@ -1,3 +1,5 @@
 # SmartForest
 
-Use VS Code with PlatformIO to build and deploy the code to esp32s.
+Use Visual Studio Code with PlatformIO to build and deploy the code.
+
+Adjust DEST_NODE and MESH_PASSWORD before deployment.
