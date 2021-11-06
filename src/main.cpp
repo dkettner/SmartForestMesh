@@ -1,11 +1,17 @@
-/*******************************************
- * Takes a picture on startup,             *
- * saves it to a memory card,              *
- * connects or builds the mesh,            *
- * sends a json object to a specific node. *
- *******************************************/
+/****************************************************
+ * Connects to or builds the mesh,                  *
+ * takes a picture once every two minutes,          *
+ * saves it to a memory card,                       *
+ * makes a report about the picture,                *
+ * puts the report in a queue,                      *
+ * tries to send the next report once every minute. *
+ ****************************************************/
 
 #include <Arduino.h>
+#include <cppQueue.h>
+#include <painlessMesh.h>
+#include <painlessmesh/base64.hpp>
+#include "painlessmesh/plugin.hpp"
 
 #include <TensorFlowLite_ESP32.h>
 #include <tensorflow/lite/experimental/micro/kernels/micro_ops.h>
@@ -14,10 +20,6 @@
 #include <tensorflow/lite/experimental/micro/micro_interpreter.h>
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/version.h"
-
-#include <painlessMesh.h>
-#include <painlessmesh/base64.hpp>
-#include "painlessmesh/plugin.hpp"
 
 #include <EEPROM.h>
 #include "esp_camera.h"
@@ -56,75 +58,81 @@
 #define   DEST_NODE       3177562153
 
 // Custom package for transmission over the mesh network
-class PictureDataPackage : public painlessmesh::plugin::SinglePackage {
+class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
  public:
-  String pictureName;
-  String isADeer;
+  int nodePrefix;
+  int pictureIndex;
+  float deerProbability;
 
   // Each package has to be identified by a unique ID
   // Values <30 are reserved for default messages, 
   // so using 31 for this package
-  PictureDataPackage() : painlessmesh::plugin::SinglePackage(31) {}
+  PictureReportPackage() : painlessmesh::plugin::SinglePackage(31) {}
 
-  // Convert json object into a PictureDataPackage
-  PictureDataPackage(JsonObject jsonObj) : painlessmesh::plugin::SinglePackage(jsonObj) {
-    pictureName = jsonObj["pictureName"].as<String>();
-    isADeer = jsonObj["isADeer"].as<String>();
+  // Convert json object into a PictureReportPackage
+  PictureReportPackage(JsonObject jsonObj) : painlessmesh::plugin::SinglePackage(jsonObj) {
+    nodePrefix = jsonObj["nodePrefix"].as<int>();
+    pictureIndex = jsonObj["pictureIndex"].as<int>();
+    deerProbability = jsonObj["deerProbability"].as<float>();
   }
 
-  // Convert PictureDataPackage to json object
+  // Convert PictureReportPackage to json object
   JsonObject addTo(JsonObject &&jsonObj) const {
     jsonObj = painlessmesh::plugin::SinglePackage::addTo(std::move(jsonObj));
-    jsonObj["pictureName"] = pictureName;
-    jsonObj["isADeer"] = isADeer;
+    jsonObj["nodePrefix"] = nodePrefix;
+    jsonObj["pictureIndex"] = pictureIndex;
+    jsonObj["deerProbability"] = deerProbability;
 
     return jsonObj;
   }
   
   // Memory to reserve for converting this object to json
   size_t jsonObjectSize() const {
-    return JSON_OBJECT_SIZE(noJsonFields + 2)
-            + round(1.1*pictureName.length() 
-                    + 1.1*isADeer.length());
+    return JSON_OBJECT_SIZE(noJsonFields + 3)
+            + round(1.1*sizeof(nodePrefix)
+                    + 1.1*sizeof(pictureIndex)
+                    + 1.1*sizeof(deerProbability));
 
   }
 
-  bool isInitialized() {
-    return !pictureName.isEmpty() && !isADeer.isEmpty(); //&& !pictureBase64.isEmpty();
+  String getFullPictureName() {
+    return String(nodePrefix) + "_" + String(pictureIndex) + ".jpg";
   }
 };
 
 Scheduler userScheduler; 
 painlessMesh mesh;
-PictureDataPackage pictureData; // TODO: Replace with QueueArray
+cppQueue reportQueue(sizeof(PictureReportPackage), 10, FIFO);
+// PictureReportPackage newReport; // TODO: Replace with QueueArray
 int pictureNumber = 0;
 
 /*  USER TASKS  */
 void sendReport();
 Task taskSendReport(TASK_SECOND * 60, TASK_FOREVER, &sendReport);
 void sendReport() {
-  if (!pictureData.isInitialized()) {
-    Serial.println("pictureData is not initialized!");
+  if (reportQueue.isEmpty()) {
+    Serial.println("taskSendReport: Queue is empty, nothing to send.");
+    return;
   }
   
-  if (mesh.sendPackage(&pictureData)) {
-    Serial.println("Transmission of package was successful!");
-    taskSendReport.disable();
+  PictureReportPackage firstReport;
+  reportQueue.peek(&firstReport);
+  if (mesh.sendPackage(&firstReport)) {
+    Serial.printf("taskSendReport: Transmission of report \"%s\" was successful.\n", firstReport.getFullPictureName().c_str());
+    reportQueue.drop();
   } else {
-    Serial.println("Failed to send package!");
-    Serial.printf("Will try again in 60 seconds.\n\n");
+    Serial.printf("taskSendreport: Failed to send report \"%s\"!\n", firstReport.getFullPictureName().c_str());
   }
 }
 
 void takePicture();
-Task taskTakePicture(TASK_SECOND * 30, TASK_ONCE, &takePicture);
+Task taskTakePicture(TASK_SECOND * 120, TASK_FOREVER, &takePicture);
 void takePicture() {
-    // Taking the picture and saving the result to frameBuffer
-  Serial.println("Starting to take a picture.");
+  Serial.println("taskTakePicture: Starting to take a picture.");
   camera_fb_t * frameBuffer = NULL;
   frameBuffer = esp_camera_fb_get();
   if(!frameBuffer) {
-    Serial.println("Camera capture failed!");
+    Serial.println("taskTakePicture: Camera capture failed!");
     return;
   }
   
@@ -133,40 +141,55 @@ void takePicture() {
   
   // saving the picture to the sd card
   String path = "/" + String(mesh.getNodeId()).substring(6) + "_" + String(pictureNumber) +".jpg";
-  fs::FS &fs = SD_MMC;  
+  fs::FS &fs = SD_MMC;
   File file = fs.open(path.c_str(), FILE_WRITE);
   if(!file) {
-    Serial.println("Failed to open file in writing mode!");
+    Serial.println("taskTakePicture: Failed to open file in writing mode!");
   } else {
     file.write(frameBuffer->buf, frameBuffer->len); // payload (image), payload length
-    Serial.printf("Saved file to path: %s\n\n", path.c_str());
+    Serial.printf("taskTakePicture: Saved picture to path: %s\n", path.c_str());
     EEPROM.write(0, pictureNumber); // update picture number in EEPROM
     EEPROM.commit();
   }
   file.close();
   
-  // Turns off the on-board LED connected to GPIO 4
-  pinMode(GPIO_NUM_4, OUTPUT);
-  digitalWrite(GPIO_NUM_4, LOW);
-  rtc_gpio_hold_en(GPIO_NUM_4);
-  
-  // Building the package
-  pictureData.from = mesh.getNodeId();
-  pictureData.dest = DEST_NODE;  // mac address of master node
-  pictureData.pictureName = path.substring(1);
-  pictureData.isADeer = "Yes"; // put tensorflow stuff here later
+  // Build and enqueue the new report
+  PictureReportPackage newReport;
+  newReport.from = mesh.getNodeId();
+  newReport.dest = DEST_NODE;
+  newReport.nodePrefix = mesh.getNodeId() % 10000;
+  newReport.pictureIndex = pictureNumber;
+  newReport.deerProbability = 0.5; // put tensorflow stuff here later
 
-  // freeing the space after building the package
+  if (newReport.deerProbability < 0.5) {
+    Serial.printf("taskTakePicture: No deer found on \"%s\".\n", newReport.getFullPictureName().c_str());
+    Serial.println("taskTakePicture: Report will not get pushed to queue.");
+    esp_camera_fb_return(frameBuffer);
+    return;
+  }
+
+  if (reportQueue.isFull()) {
+    Serial.println("taskTakePicture: Queue is full.");
+
+    PictureReportPackage oldestReportInQueue;
+    reportQueue.pop(&oldestReportInQueue);
+    Serial.printf("taskTakePicture: Dropped the first report: \"%s\"\n",  oldestReportInQueue.getFullPictureName().c_str());
+    // TODO: Add error logs to save old report to SD card. 
+  }
+  Serial.printf("taskTakePicture: Pushing report \"%s\" to queue.\n", newReport.getFullPictureName().c_str());
+  reportQueue.push(&newReport);
+
   esp_camera_fb_return(frameBuffer);
   
-  taskSendReport.enableIfNot();
-  taskTakePicture.disable();
+  // Turns off the on-board LED connected to GPIO 4
+  digitalWrite(GPIO_NUM_4, LOW);
 }
 
 void initializeCamAndStorage();
 Task taskInitializeCamAndStorage(TASK_SECOND * 30, TASK_ONCE, &initializeCamAndStorage);
 void initializeCamAndStorage() {
-  // configuring the camera
+  //pinMode(GPIO_NUM_4, INPUT);   // not needed?
+  
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -190,7 +213,7 @@ void initializeCamAndStorage() {
   config.pixel_format = PIXFORMAT_JPEG; 
   
   // configuring picture properties
-  if(psramFound()){
+  if (psramFound()){
     config.frame_size = FRAMESIZE_UXGA; // FRAMESIZE_ + QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA
     config.jpeg_quality = 10;
     config.fb_count = 2;
@@ -203,18 +226,18 @@ void initializeCamAndStorage() {
   // Init Camera
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
+    Serial.printf("taskInitializeCamAndStorage: Camera init failed with error 0x%x!", err);
     return;
   }
   
   // Mounting the sd card
   if (!SD_MMC.begin()) {
-    Serial.println("SD Card Mount Failed!");
+    Serial.println("taskInitializeCamAndStorage: SD Card Mount Failed!");
     return;
   }
   uint8_t cardType = SD_MMC.cardType();
   if (cardType == CARD_NONE) {
-    Serial.println("No SD Card attached!");
+    Serial.println("taskInitializeCamAndStorage: No SD Card attached!");
     return;
   }
 
@@ -228,13 +251,14 @@ void initializeCamAndStorage() {
 
 // Needed for painless library
 void newConnectionCallback(uint32_t nodeId) {
-  Serial.printf("New Connection, nodeId = %u\n", nodeId);
+  Serial.printf("mesh: New connection with node %u.\n", nodeId);
 }
 void changedConnectionCallback() {
-  Serial.printf("Changed connections\n\n");
+  Serial.println("mesh: Changed connections.");
 }
 void nodeTimeAdjustedCallback(int32_t offset) {
-  Serial.printf("Adjusted time %u. Offset = %d\n\n", mesh.getNodeTime(),offset);
+  // Uncomment if needed.
+  // Serial.printf("mesh: Adjusted time %u, offset = %d.\n", mesh.getNodeTime(), offset);
 }
 
 void setup() {
@@ -242,7 +266,7 @@ void setup() {
   Serial.begin(115200);
 
   // starting the mesh
-  mesh.setDebugMsgTypes( ERROR | STARTUP ); // set before init() to see startup messages
+  mesh.setDebugMsgTypes( ERROR | STARTUP );
   mesh.init( MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT );
   mesh.onNewConnection(&newConnectionCallback);
   mesh.onChangedConnections(&changedConnectionCallback);
@@ -250,22 +274,22 @@ void setup() {
 
   // How to handle a package of type 31
   mesh.onPackage(31, [](painlessmesh::protocol::Variant variant) {
-    auto package = variant.to<PictureDataPackage>(); 
-    Serial.printf("Node %u has taken the picture %s.\n", package.from, package.pictureName.c_str());
-    Serial.printf("Did it find a deer? -> %s.\n\n", package.isADeer.c_str());
+    auto package = variant.to<PictureReportPackage>(); 
+    Serial.printf("mesh: Node %u has taken the picture %s.\n", package.from, package.getFullPictureName().c_str());
+    Serial.printf("mesh: Deer probability: %.2f%.\n", package.deerProbability);
     return true;
   });
 
-  Serial.printf("The ID of this node is %u \n\n", mesh.getNodeId());
+  Serial.printf("mesh: The ID of this node is %u \n", mesh.getNodeId());
 
   // use this instead of adding more actions to setup() or loop()
   userScheduler.addTask(taskInitializeCamAndStorage);
   userScheduler.addTask(taskTakePicture);
   userScheduler.addTask(taskSendReport);
   
-  taskInitializeCamAndStorage.enableIfNot();
   taskTakePicture.disable();
-  taskSendReport.disable();
+  taskInitializeCamAndStorage.enableIfNot();
+  taskSendReport.enableIfNot();
 }
 
 void loop() {
