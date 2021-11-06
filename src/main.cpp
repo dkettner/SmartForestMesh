@@ -27,10 +27,16 @@
 #include "SD_MMC.h"            // SD Card ESP32
 #include "soc/soc.h"           // Disable brownout problems
 #include "soc/rtc_cntl_reg.h"  // Disable brownout problems
-#include "driver/rtc_io.h"
+#include "driver/rtc_io.h"     // not needed?
+
+// directory paths
+#define   PICTURES_PATH     "/pictures"
+#define   REPORTS_PATH      "/reports"
+#define   UPTIME_LOGS_PATH  "/uptime_logs"
+#define   ERROR_LOGS_PATH   "/error_logs"
 
 // number of bytes we want to access
-#define   EEPROM_SIZE     1 
+#define   EEPROM_SIZE     1
 
 // assign names to pin numbers
 #define   PWDN_GPIO_NUM   32
@@ -104,6 +110,12 @@ Scheduler userScheduler;
 painlessMesh mesh;
 cppQueue reportQueue(sizeof(PictureReportPackage), 10, FIFO);
 int pictureNumber = 0;
+String directories[] = {
+  PICTURES_PATH,
+  REPORTS_PATH,
+  UPTIME_LOGS_PATH,
+  ERROR_LOGS_PATH
+};
 
 /*  USER TASKS  */
 void sendReport();
@@ -135,11 +147,12 @@ void takePicture() {
     return;
   }
   
-  // increment for ascending picture numbers  
+  // Incrementing for ascending picture numbers  
   pictureNumber = EEPROM.read(0) + 1;
   
-  // saving the picture to the sd card
-  String path = "/" + String(mesh.getNodeId()).substring(6) + "_" + String(pictureNumber) +".jpg";
+  // Saving the picture to the sd card
+  String directory = PICTURES_PATH;   // dirty C/C++ String handling and conversion
+  String path = directory + "/" + String(mesh.getNodeId()).substring(6) + "_" + String(pictureNumber) + ".jpg";
   fs::FS &fs = SD_MMC;
   File file = fs.open(path.c_str(), FILE_WRITE);
   if(!file) {
@@ -239,6 +252,21 @@ void initializeCamAndStorage() {
     Serial.println("taskInitializeCamAndStorage: No SD Card attached!");
     return;
   }
+  
+  // Creating directories
+  fs::FS &fs = SD_MMC;
+  for (String currentDirectory: directories) {
+    if (!fs.exists(currentDirectory.c_str())) {
+      if (fs.mkdir(currentDirectory.c_str())) {
+        Serial.printf("taskInitializeCamAndStorage: Created directory \"%s\" \n", currentDirectory.c_str());
+      } else {
+        Serial.printf("taskInitializeCamAndStorage: Could not create directory \"%s\"!.\n", currentDirectory.c_str());
+        // Try again?
+      }
+    } else {
+      Serial.printf("taskInitializeCamAndStorage: Directory \"%s\" already exists.\n", currentDirectory.c_str());
+    }
+  }
 
   // initialize EEPROM for updating pictureNumber
   EEPROM.begin(EEPROM_SIZE);
@@ -275,11 +303,11 @@ void setup() {
   mesh.onPackage(31, [](painlessmesh::protocol::Variant variant) {
     auto package = variant.to<PictureReportPackage>(); 
     Serial.printf("mesh: Node %u has taken the picture %s.\n", package.from, package.getFullPictureName().c_str());
-    Serial.printf("mesh: Deer probability: %.2f%.\n", package.deerProbability);
+    Serial.printf("mesh: Deer probability: %.2f\n", package.deerProbability);
     return true;
   });
 
-  Serial.printf("mesh: The ID of this node is %u \n", mesh.getNodeId());
+  Serial.printf("mesh: The ID of this node is %u.\n", mesh.getNodeId());
 
   // use this instead of adding more actions to setup() or loop()
   userScheduler.addTask(taskInitializeCamAndStorage);
