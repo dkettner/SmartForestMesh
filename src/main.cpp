@@ -103,7 +103,6 @@ class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
 Scheduler userScheduler; 
 painlessMesh mesh;
 cppQueue reportQueue(sizeof(PictureReportPackage), 10, FIFO);
-// PictureReportPackage newReport; // TODO: Replace with QueueArray
 int pictureNumber = 0;
 
 /*  USER TASKS  */
