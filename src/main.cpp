@@ -5,6 +5,7 @@
  * makes a report about the picture,                *
  * puts the report in a queue,                      *
  * tries to send the next report once every minute. *
+ * Logs its uptime once every 15 minutes.           *
  ****************************************************/
 
 #include <Arduino.h>
@@ -32,8 +33,8 @@
 // directory paths
 #define   PICTURES_PATH     "/pictures"
 #define   REPORTS_PATH      "/reports"
-#define   UPTIME_LOGS_PATH  "/uptime_logs"
-#define   ERROR_LOGS_PATH   "/error_logs"
+#define   UPTIME_LOGS_PATH  "/uptimeLogs"
+#define   ERROR_LOGS_PATH   "/errorLogs"
 
 // number of bytes we want to access
 #define   EEPROM_SIZE     1
@@ -110,7 +111,7 @@ Scheduler userScheduler;
 painlessMesh mesh;
 cppQueue reportQueue(sizeof(PictureReportPackage), 10, FIFO);
 int pictureNumber = 0;
-String uptimeLogPath; // Does this work?
+String uptimeLogPath;
 String directories[] = {
   PICTURES_PATH,
   REPORTS_PATH,
@@ -162,6 +163,7 @@ void takePicture() {
     file.write(frameBuffer->buf, frameBuffer->len); // payload (image), payload length
     Serial.printf("taskTakePicture: Saved picture to path: %s\n", path.c_str());
     EEPROM.write(0, pictureNumber); // update picture number in EEPROM
+    // EEPROM.write(0,0); // to reset EEPROM
     EEPROM.commit();
   }
   file.close();
@@ -198,17 +200,34 @@ void takePicture() {
   digitalWrite(GPIO_NUM_4, LOW);
 }
 
+void logUptime();
+Task taskLogUptime(TASK_MINUTE * 15, TASK_FOREVER, &logUptime);
+void logUptime() {
+  fs::FS &fs = SD_MMC;
+  File uptimeLog = fs.open(uptimeLogPath.c_str(), FILE_APPEND);
+  if(!uptimeLog) {
+    Serial.printf("taskInitializeStorage: Failed to open %s!\n", uptimeLogPath.c_str());
+  } else {
+    float newUptime = (float) millis() / 60000;   // uptime in minutes
+    String newUptimeEntry = String(newUptime) + " min" ;
+    uptimeLog.println(newUptimeEntry.c_str());
+    uptimeLog.close();
+
+    Serial.printf("taskLogUptime: Appended new uptime \"%.2f min\".\n", newUptime);
+  }
+}
+
 void initializeStorage();
 Task taskInitializeStorage(TASK_SECOND * 30, TASK_ONCE, &initializeStorage);
 void initializeStorage() {
     // Mounting the sd card
   if (!SD_MMC.begin()) {
-    Serial.println("taskInitializeStorage: SD Card Mount Failed!");
+    Serial.println("taskInitializeStorage: SD card mount failed!");
     return;
   }
   uint8_t cardType = SD_MMC.cardType();
   if (cardType == CARD_NONE) {
-    Serial.println("taskInitializeStorage: No SD Card attached!");
+    Serial.println("taskInitializeStorage: No SD card attached!");
     return;
   }
   Serial.println("taskInitializeStorage: SD card mount was successful.");
@@ -243,7 +262,7 @@ void initializeStorage() {
     Serial.printf("taskInitializeStorage: Failed to create %s!\n", logPath.c_str());
   } else {
     Serial.printf("taskInitializeStorage: Created %s.\n", logPath.c_str());
-    uptimeLogPath = logPath;  // Does this work?
+    uptimeLogPath = logPath;
   }
   newUptimeLog.close();
 
@@ -252,6 +271,7 @@ void initializeStorage() {
   Serial.println("taskInitializeStorage: Initialized EEPROM.");
 
   taskTakePicture.enableIfNot();
+  taskLogUptime.enableIfNot();
   taskInitializeStorage.disable();
 }
 
@@ -304,12 +324,6 @@ void initializeCamera() {
   Serial.println("taskInitializeCamera: Finished configuration.");
   taskInitializeStorage.enableIfNot();
   taskInitializeCamera.disable();
-}
-
-void logUptime();
-Task taskLogUptime(TASK_MINUTE * 15, TASK_FOREVER, &logUptime);
-void logUptime() {
-  // append new uptime to log
 }
 /*  END OF USER TASKS */
 
