@@ -110,6 +110,7 @@ Scheduler userScheduler;
 painlessMesh mesh;
 cppQueue reportQueue(sizeof(PictureReportPackage), 10, FIFO);
 int pictureNumber = 0;
+String uptimeLogPath; // Does this work?
 String directories[] = {
   PICTURES_PATH,
   REPORTS_PATH,
@@ -132,7 +133,7 @@ void sendReport() {
     Serial.printf("taskSendReport: Transmission of report \"%s\" was successful.\n", firstReport.getFullPictureName().c_str());
     reportQueue.drop();
   } else {
-    Serial.printf("taskSendreport: Failed to send report \"%s\"!\n", firstReport.getFullPictureName().c_str());
+    Serial.printf("taskSendReport: Failed to send report \"%s\"!\n", firstReport.getFullPictureName().c_str());
   }
 }
 
@@ -169,7 +170,7 @@ void takePicture() {
   PictureReportPackage newReport;
   newReport.from = mesh.getNodeId();
   newReport.dest = DEST_NODE;
-  newReport.nodePrefix = mesh.getNodeId() % 10000;
+  newReport.nodePrefix = mesh.getNodeId() % 10000; // only the lowest four digits
   newReport.pictureIndex = pictureNumber;
   newReport.deerProbability = 0.5; // put tensorflow stuff here later
 
@@ -197,11 +198,69 @@ void takePicture() {
   digitalWrite(GPIO_NUM_4, LOW);
 }
 
-void initializeCamAndStorage();
-Task taskInitializeCamAndStorage(TASK_SECOND * 30, TASK_ONCE, &initializeCamAndStorage);
-void initializeCamAndStorage() {
+void initializeStorage();
+Task taskInitializeStorage(TASK_SECOND * 30, TASK_ONCE, &initializeStorage);
+void initializeStorage() {
+    // Mounting the sd card
+  if (!SD_MMC.begin()) {
+    Serial.println("taskInitializeStorage: SD Card Mount Failed!");
+    return;
+  }
+  uint8_t cardType = SD_MMC.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("taskInitializeStorage: No SD Card attached!");
+    return;
+  }
+  Serial.println("taskInitializeStorage: SD card mount was successful.");
+  
+  // Creating directories
+  Serial.println("taskInitializeStorage: Starting to create nonexistent directories.");
+  fs::FS &fs = SD_MMC;
+  for (String currentDirectory: directories) {
+    if (!fs.exists(currentDirectory.c_str())) {
+      if (fs.mkdir(currentDirectory.c_str())) {
+        Serial.printf("taskInitializeStorage: Created directory \"%s\" \n", currentDirectory.c_str());
+      } else {
+        Serial.printf("taskInitializeStorage: Could not create directory \"%s\"!.\n", currentDirectory.c_str());
+        // Try again?
+      }
+    } else {
+      Serial.printf("taskInitializeStorage: Directory \"%s\" already exists.\n", currentDirectory.c_str());
+    }
+  }
+
+  // Creating new uptime log
+  String directory = UPTIME_LOGS_PATH;
+  String logPath;
+  int logNumber = 0;
+  do {
+    logPath = directory + "/uptimeLog" + String(logNumber) + ".txt";
+    logNumber++;
+  } while (fs.exists(logPath.c_str()));
+
+  File newUptimeLog = fs.open(logPath.c_str(), FILE_WRITE);
+  if(!newUptimeLog) {
+    Serial.printf("taskInitializeStorage: Failed to create %s!\n", logPath.c_str());
+  } else {
+    Serial.printf("taskInitializeStorage: Created %s.\n", logPath.c_str());
+    uptimeLogPath = logPath;  // Does this work?
+  }
+  newUptimeLog.close();
+
+  // Initializing EEPROM for updating pictureNumber
+  EEPROM.begin(EEPROM_SIZE);
+  Serial.println("taskInitializeStorage: Initialized EEPROM.");
+
+  taskTakePicture.enableIfNot();
+  taskInitializeStorage.disable();
+}
+
+void initializeCamera();
+Task taskInitializeCamera(TASK_SECOND * 30, TASK_ONCE, &initializeCamera);
+void initializeCamera() {
   //pinMode(GPIO_NUM_4, INPUT);   // not needed?
   
+  Serial.println("taskInitializeCamera: Starting to configure camera and picture properties.");
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -238,41 +297,19 @@ void initializeCamAndStorage() {
   // Init Camera
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("taskInitializeCamAndStorage: Camera init failed with error 0x%x!", err);
+    Serial.printf("taskInitializeCamera: Camera init failed with error 0x%x!", err);
     return;
-  }
-  
-  // Mounting the sd card
-  if (!SD_MMC.begin()) {
-    Serial.println("taskInitializeCamAndStorage: SD Card Mount Failed!");
-    return;
-  }
-  uint8_t cardType = SD_MMC.cardType();
-  if (cardType == CARD_NONE) {
-    Serial.println("taskInitializeCamAndStorage: No SD Card attached!");
-    return;
-  }
-  
-  // Creating directories
-  fs::FS &fs = SD_MMC;
-  for (String currentDirectory: directories) {
-    if (!fs.exists(currentDirectory.c_str())) {
-      if (fs.mkdir(currentDirectory.c_str())) {
-        Serial.printf("taskInitializeCamAndStorage: Created directory \"%s\" \n", currentDirectory.c_str());
-      } else {
-        Serial.printf("taskInitializeCamAndStorage: Could not create directory \"%s\"!.\n", currentDirectory.c_str());
-        // Try again?
-      }
-    } else {
-      Serial.printf("taskInitializeCamAndStorage: Directory \"%s\" already exists.\n", currentDirectory.c_str());
-    }
   }
 
-  // initialize EEPROM for updating pictureNumber
-  EEPROM.begin(EEPROM_SIZE);
+  Serial.println("taskInitializeCamera: Finished configuration.");
+  taskInitializeStorage.enableIfNot();
+  taskInitializeCamera.disable();
+}
 
-  taskTakePicture.enable();
-  taskInitializeCamAndStorage.disable();
+void logUptime();
+Task taskLogUptime(TASK_MINUTE * 15, TASK_FOREVER, &logUptime);
+void logUptime() {
+  // append new uptime to log
 }
 /*  END OF USER TASKS */
 
@@ -307,15 +344,20 @@ void setup() {
     return true;
   });
 
-  Serial.printf("mesh: The ID of this node is %u.\n", mesh.getNodeId());
+  Serial.printf("\nmesh: The ID of this node is %u.\n", mesh.getNodeId());
 
   // use this instead of adding more actions to setup() or loop()
-  userScheduler.addTask(taskInitializeCamAndStorage);
+  userScheduler.addTask(taskInitializeCamera);
+  userScheduler.addTask(taskInitializeStorage);
   userScheduler.addTask(taskTakePicture);
   userScheduler.addTask(taskSendReport);
+  userScheduler.addTask(taskLogUptime);
   
+  // TODO: race conditions?
   taskTakePicture.disable();
-  taskInitializeCamAndStorage.enableIfNot();
+  taskLogUptime.disable();
+  taskInitializeStorage.disable();
+  taskInitializeCamera.enableIfNot();
   taskSendReport.enableIfNot();
 }
 
