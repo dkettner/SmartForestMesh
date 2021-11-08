@@ -30,14 +30,15 @@
 #include "soc/rtc_cntl_reg.h"  // Disable brownout problems
 #include "driver/rtc_io.h"     // not needed?
 
+#define   EEPROM_SIZE 8
+#define   PICTURE_INDEX_ADDRESS 0
+#define   UPTIME_INDEX_ADDRESS 4
+
 // directory paths
 #define   PICTURES_PATH     "/pictures"
 #define   REPORTS_PATH      "/reports"
 #define   UPTIME_LOGS_PATH  "/uptimeLogs"
 #define   ERROR_LOGS_PATH   "/errorLogs"
-
-// number of bytes we want to access
-#define   EEPROM_SIZE     1
 
 // assign names to pin numbers
 #define   PWDN_GPIO_NUM   32
@@ -67,8 +68,7 @@
 // Custom package for transmission over the mesh network
 class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
  public:
-  int nodePrefix;
-  int pictureIndex;
+  unsigned long pictureIndex;
   float deerProbability;
 
   // Each package has to be identified by a unique ID
@@ -78,15 +78,13 @@ class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
 
   // Convert json object into a PictureReportPackage
   PictureReportPackage(JsonObject jsonObj) : painlessmesh::plugin::SinglePackage(jsonObj) {
-    nodePrefix = jsonObj["nodePrefix"].as<int>();
-    pictureIndex = jsonObj["pictureIndex"].as<int>();
+    pictureIndex = jsonObj["pictureIndex"].as<unsigned long>();
     deerProbability = jsonObj["deerProbability"].as<float>();
   }
 
   // Convert PictureReportPackage to json object
   JsonObject addTo(JsonObject &&jsonObj) const {
     jsonObj = painlessmesh::plugin::SinglePackage::addTo(std::move(jsonObj));
-    jsonObj["nodePrefix"] = nodePrefix;
     jsonObj["pictureIndex"] = pictureIndex;
     jsonObj["deerProbability"] = deerProbability;
 
@@ -95,22 +93,29 @@ class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
   
   // Memory to reserve for converting this object to json
   size_t jsonObjectSize() const {
-    return JSON_OBJECT_SIZE(noJsonFields + 3)
-            + round(1.1*sizeof(nodePrefix)
-                    + 1.1*sizeof(pictureIndex)
+    return JSON_OBJECT_SIZE(noJsonFields + 2)
+            + round(1.1*sizeof(pictureIndex)
                     + 1.1*sizeof(deerProbability));
 
   }
 
+  // TODO: Refactor this
   String getFullPictureName() {
-    return String(nodePrefix) + "_" + String(pictureIndex) + ".jpg";
+    return String(this->from % 1000) + "_" + String(pictureIndex) + ".jpg";
+  }
+
+  String getFullReportName() {
+    return String(this->from % 1000) + "_" + String(pictureIndex) + ".log";
+  }
+
+  String getFullErrorName() {
+    return String(this->from % 1000) + "_" + String(pictureIndex) + ".err";
   }
 };
 
 Scheduler userScheduler; 
 painlessMesh mesh;
 cppQueue reportQueue(sizeof(PictureReportPackage), 10, FIFO);
-int pictureNumber = 0;
 String uptimeLogPath;
 String directories[] = {
   PICTURES_PATH,
@@ -128,13 +133,13 @@ void sendReport() {
     return;
   }
   
-  PictureReportPackage firstReport;
-  reportQueue.peek(&firstReport);
-  if (mesh.sendPackage(&firstReport)) {
-    Serial.printf("taskSendReport: Transmission of report \"%s\" was successful.\n", firstReport.getFullPictureName().c_str());
+  PictureReportPackage oldestReport;
+  reportQueue.peek(&oldestReport);
+  if (mesh.sendPackage(&oldestReport)) {
+    Serial.printf("taskSendReport: Transmission of report %s was successful.\n", oldestReport.getFullReportName().c_str());
     reportQueue.drop();
   } else {
-    Serial.printf("taskSendReport: Failed to send report \"%s\"!\n", firstReport.getFullPictureName().c_str());
+    Serial.printf("taskSendReport: Failed to send report %s!\n", oldestReport.getFullReportName().c_str());
   }
 }
 
@@ -142,6 +147,12 @@ void takePicture();
 Task taskTakePicture(TASK_SECOND * 120, TASK_FOREVER, &takePicture);
 void takePicture() {
   Serial.println("taskTakePicture: Starting to take a picture.");
+  fs::FS &fs = SD_MMC;
+  unsigned long nextPictureIndex = EEPROM.readULong(PICTURE_INDEX_ADDRESS);
+  EEPROM.writeULong(PICTURE_INDEX_ADDRESS, nextPictureIndex + 1);   // increment picture number in EEPROM
+  EEPROM.commit(); // EEPROM.end(); ???
+
+  // Taking the picture
   camera_fb_t * frameBuffer = NULL;
   frameBuffer = esp_camera_fb_get();
   if(!frameBuffer) {
@@ -149,54 +160,72 @@ void takePicture() {
     return;
   }
   
-  // Incrementing for ascending picture numbers  
-  pictureNumber = EEPROM.read(0) + 1;
-  
   // Saving the picture to the sd card
-  String directory = PICTURES_PATH;   // dirty C/C++ String handling and conversion
-  String path = directory + "/" + String(mesh.getNodeId()).substring(6) + "_" + String(pictureNumber) + ".jpg";
-  fs::FS &fs = SD_MMC;
+  String path = String(PICTURES_PATH) + "/" + String(mesh.getNodeId()).substring(7) + "_" + String(nextPictureIndex) + ".jpg";
   File file = fs.open(path.c_str(), FILE_WRITE);
   if(!file) {
     Serial.println("taskTakePicture: Failed to open file in writing mode!");
   } else {
-    file.write(frameBuffer->buf, frameBuffer->len); // payload (image), payload length
+    file.write(frameBuffer->buf, frameBuffer->len);   // payload (image), payload length
     Serial.printf("taskTakePicture: Saved picture to path: %s\n", path.c_str());
-    EEPROM.write(0, pictureNumber); // update picture number in EEPROM
-    // EEPROM.write(0,0); // to reset EEPROM
-    EEPROM.commit();
   }
   file.close();
   
-  // Build and enqueue the new report
+  // Build the new report
   PictureReportPackage newReport;
   newReport.from = mesh.getNodeId();
   newReport.dest = DEST_NODE;
-  newReport.nodePrefix = mesh.getNodeId() % 10000; // only the lowest four digits
-  newReport.pictureIndex = pictureNumber;
+  newReport.pictureIndex = nextPictureIndex;
   newReport.deerProbability = 0.5; // put tensorflow stuff here later
 
+  // Save Report to SD card
+  String newReportLogPath = String(REPORTS_PATH) + "/" + newReport.getFullReportName();
+  File newReportLog = fs.open(newReportLogPath, FILE_WRITE);
+  if (!newReportLog) {
+    Serial.printf("taskTakePicture: Could not create %s!\n", newReportLogPath.c_str());
+  } else {
+    // TODO: Use proper json objects
+    newReportLog.printf("Report about %s\n\n", newReport.getFullPictureName().c_str());
+    newReportLog.printf("from: %zu\n", newReport.from);
+    newReportLog.printf("dest: %zu\n", newReport.dest);
+    newReportLog.printf("pictureIndex: %lu\n", newReport.pictureIndex);
+    newReportLog.printf("deerProbability: %.2f\n", newReport.deerProbability);
+    newReportLog.close();
+
+    Serial.printf("taskTakePicture: Saved report to path: %s\n", newReportLogPath.c_str());
+  }
+
+  // Return if no deer was found
   if (newReport.deerProbability < 0.5) {
-    Serial.printf("taskTakePicture: No deer found on \"%s\".\n", newReport.getFullPictureName().c_str());
+    Serial.printf("taskTakePicture: No deer found on %s.\n", newReport.getFullPictureName().c_str());
     Serial.println("taskTakePicture: Report will not get pushed to queue.");
     esp_camera_fb_return(frameBuffer);
     return;
   }
 
+  // Drop oldest report if queue is full and create error log.
   if (reportQueue.isFull()) {
     Serial.println("taskTakePicture: Queue is full.");
 
-    PictureReportPackage oldestReportInQueue;
-    reportQueue.pop(&oldestReportInQueue);
-    Serial.printf("taskTakePicture: Dropped the first report: \"%s\"\n",  oldestReportInQueue.getFullPictureName().c_str());
-    // TODO: Add error logs to save old report to SD card. 
+    PictureReportPackage oldestReport;
+    reportQueue.pop(&oldestReport);
+    Serial.printf("taskTakePicture: Dropped the oldest report: %s\n", oldestReport.getFullReportName().c_str());
+    String newErrorLogPath = String(ERROR_LOGS_PATH) + "/" + oldestReport.getFullErrorName();
+    File newErrorLog = fs.open(newErrorLogPath.c_str(), FILE_WRITE);
+    if (!newErrorLog) {
+      Serial.printf("taskTakePicture: Could not create %s!\n", newErrorLogPath.c_str());
+    } else {
+      Serial.printf("taskTakePicture: Saved error log to path: %s\n", newErrorLogPath.c_str());
+      newErrorLog.close();
+    }
   }
-  Serial.printf("taskTakePicture: Pushing report \"%s\" to queue.\n", newReport.getFullPictureName().c_str());
-  reportQueue.push(&newReport);
 
+  // Push new report to queue
+  reportQueue.push(&newReport);
+  Serial.println("taskTakePicture: Pushed report to queue.");
+
+  // Cleanup
   esp_camera_fb_return(frameBuffer);
-  
-  // Turns off the on-board LED connected to GPIO 4
   digitalWrite(GPIO_NUM_4, LOW);
 }
 
@@ -213,14 +242,27 @@ void logUptime() {
     uptimeLog.println(newUptimeEntry.c_str());
     uptimeLog.close();
 
-    Serial.printf("taskLogUptime: Appended new uptime \"%.2f min\".\n", newUptime);
+    Serial.printf("taskLogUptime: Appended new uptime: %.2f min.\n", newUptime);
   }
 }
 
+
+void resetEeprom(int range) {
+  for (int eepromAddress = 0; eepromAddress < range; eepromAddress++) {
+    EEPROM.write(eepromAddress, 0);
+  }
+  EEPROM.commit();
+  return;
+}
 void initializeStorage();
 Task taskInitializeStorage(TASK_SECOND * 30, TASK_ONCE, &initializeStorage);
 void initializeStorage() {
-    // Mounting the sd card
+    // Initializing EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  Serial.println("taskInitializeStorage: Initialized EEPROM.");
+  // resetEeprom(EEPROM_SIZE); // uncomment if needed
+
+  // Mounting the sd card
   if (!SD_MMC.begin()) {
     Serial.println("taskInitializeStorage: SD card mount failed!");
     return;
@@ -238,37 +280,31 @@ void initializeStorage() {
   for (String currentDirectory: directories) {
     if (!fs.exists(currentDirectory.c_str())) {
       if (fs.mkdir(currentDirectory.c_str())) {
-        Serial.printf("taskInitializeStorage: Created directory \"%s\" \n", currentDirectory.c_str());
+        Serial.printf("taskInitializeStorage: Created directory: %s \n", currentDirectory.c_str());
       } else {
-        Serial.printf("taskInitializeStorage: Could not create directory \"%s\"!.\n", currentDirectory.c_str());
+        Serial.printf("taskInitializeStorage: Could not create directory: %s !\n", currentDirectory.c_str());
         // Try again?
       }
     } else {
-      Serial.printf("taskInitializeStorage: Directory \"%s\" already exists.\n", currentDirectory.c_str());
+      Serial.printf("taskInitializeStorage: Directory %s already exists.\n", currentDirectory.c_str());
     }
   }
 
   // Creating new uptime log
-  String directory = UPTIME_LOGS_PATH;
-  String logPath;
-  int logNumber = 0;
-  do {
-    logPath = directory + "/uptimeLog" + String(logNumber) + ".txt";
-    logNumber++;
-  } while (fs.exists(logPath.c_str()));
+  unsigned long nextUptimeIndex = EEPROM.readULong(UPTIME_INDEX_ADDRESS);
+  EEPROM.writeULong(UPTIME_INDEX_ADDRESS, nextUptimeIndex + 1);
+  EEPROM.commit(); // EEPROM.end(); ?
 
-  File newUptimeLog = fs.open(logPath.c_str(), FILE_WRITE);
+  String newUptimelogPath = String(UPTIME_LOGS_PATH) + "/ut" + String(nextUptimeIndex) + ".log";
+
+  File newUptimeLog = fs.open(newUptimelogPath.c_str(), FILE_WRITE);
   if(!newUptimeLog) {
-    Serial.printf("taskInitializeStorage: Failed to create %s!\n", logPath.c_str());
+    Serial.printf("taskInitializeStorage: Failed to create %s!\n", newUptimelogPath.c_str());
   } else {
-    Serial.printf("taskInitializeStorage: Created %s.\n", logPath.c_str());
-    uptimeLogPath = logPath;
+    Serial.printf("taskInitializeStorage: Saved uptime log to path: %s\n", newUptimelogPath.c_str());
+    uptimeLogPath = newUptimelogPath;
   }
   newUptimeLog.close();
-
-  // Initializing EEPROM for updating pictureNumber
-  EEPROM.begin(EEPROM_SIZE);
-  Serial.println("taskInitializeStorage: Initialized EEPROM.");
 
   taskTakePicture.enableIfNot();
   taskLogUptime.enableIfNot();
@@ -280,7 +316,7 @@ Task taskInitializeCamera(TASK_SECOND * 30, TASK_ONCE, &initializeCamera);
 void initializeCamera() {
   //pinMode(GPIO_NUM_4, INPUT);   // not needed?
   
-  Serial.println("taskInitializeCamera: Starting to configure camera and picture properties.");
+  Serial.println("taskInitializeCamera: Configuring camera and picture properties.");
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -353,12 +389,12 @@ void setup() {
   // How to handle a package of type 31
   mesh.onPackage(31, [](painlessmesh::protocol::Variant variant) {
     auto package = variant.to<PictureReportPackage>(); 
-    Serial.printf("mesh: Node %u has taken the picture %s.\n", package.from, package.getFullPictureName().c_str());
+    Serial.printf("mesh: Node %zu has taken the picture %s.\n", package.from, package.getFullPictureName().c_str());
     Serial.printf("mesh: Deer probability: %.2f\n", package.deerProbability);
     return true;
   });
 
-  Serial.printf("\nmesh: The ID of this node is %u.\n", mesh.getNodeId());
+  Serial.printf("\nmesh: The ID of this node is %zu.\n", mesh.getNodeId());
 
   // use this instead of adding more actions to setup() or loop()
   userScheduler.addTask(taskInitializeCamera);
