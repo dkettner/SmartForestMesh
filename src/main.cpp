@@ -34,6 +34,15 @@
 #define   PICTURE_INDEX_ADDRESS 0
 #define   UPTIME_INDEX_ADDRESS 4
 
+// downscaling and motion detection
+#define SOURCE_WIDTH 1024
+#define SOURCE_HEIGHT 768
+#define BLOCK_SIZE 16
+#define DEST_WIDTH (SOURCE_WIDTH / BLOCK_SIZE)
+#define DEST_HEIGHT (SOURCE_HEIGHT / BLOCK_SIZE)
+#define BLOCK_DIFF_THRESHOLD 0.30
+#define IMAGE_DIFF_THRESHOLD 0.15
+
 // directory paths
 #define   PICTURES_PATH     "/pictures"
 #define   REPORTS_PATH      "/reports"
@@ -123,6 +132,8 @@ String directories[] = {
   UPTIME_LOGS_PATH,
   ERROR_LOGS_PATH
 };
+uint8_t previousFrame[DEST_WIDTH * DEST_HEIGHT] = {0};
+uint8_t currentFrame[DEST_WIDTH * DEST_HEIGHT] = {0};
 
 /*  USER TASKS  */
 void sendReport();
@@ -229,6 +240,168 @@ void takePicture() {
   digitalWrite(GPIO_NUM_4, LOW);
 }
 
+void scaleDown(uint8_t * sourceFrame, uint8_t destinationFrame[DEST_WIDTH*DEST_HEIGHT], const uint8_t blockSize) {
+  const uint32_t blockRowsOffset = blockSize * DEST_WIDTH;
+  uint32_t offsetY = 0;
+  uint8_t block[blockSize][blockSize];
+
+  for (uint16_t destY = 0; destY < DEST_HEIGHT; destY++) {
+    for (uint16_t destX = 0; destX < DEST_WIDTH; destX++) {
+      uint32_t offset = offsetY + destX * blockSize;
+
+      // fill the block
+      for (uint8_t y = 0; y < blockSize; y++) {
+        memcpy(block[y], sourceFrame + offset, blockSize);
+        offset += SOURCE_WIDTH;
+      }
+
+      // destinationFrame[destY*DEST_WIDTH + destX] = block[SOURCE_HEIGHT / DEST_HEIGHT / 2][SOURCE_WIDTH / DEST_WIDTH / 2];
+      
+      uint32_t accumulator = 0;
+      uint8_t count = 0;
+
+      // left diagonal
+      for (float x = 0, y = 0; x < BLOCK_SIZE && y < BLOCK_SIZE; ) {
+        accumulator += block[(uint8_t) y][(uint8_t) x];
+        count += 1;
+        x += 1;
+        y += 1;
+      }
+
+      // right diagonal
+      for (float x = BLOCK_SIZE - 1, y = BLOCK_SIZE - 1; x >= 0 && y >= 0; ) {
+        accumulator += block[(uint8_t) y][(uint8_t) x];
+        count += 1;
+        x -= 1;
+        y -= 1;
+      }
+
+      destinationFrame[destY*DEST_WIDTH + destX] = accumulator / count;      
+    }
+    offsetY += blockRowsOffset;
+  }
+}
+
+bool motionDetected() {
+  uint16_t changes = 0;
+  const uint16_t blocks = DEST_WIDTH * DEST_HEIGHT;
+
+  for (int y = 0; y < DEST_HEIGHT; y++) {
+    for (int x = 0; x < DEST_WIDTH; x++) {
+      float current = currentFrame[y * DEST_WIDTH + x];
+      float previous = previousFrame[y * DEST_WIDTH + x];
+      float delta = abs(current - previous) / previous;
+
+      if (delta >= BLOCK_DIFF_THRESHOLD) {
+          changes += 1;
+      }
+    }
+  }
+
+  Serial.printf("changes = %zu, blocks = %zu\n", changes, blocks);
+
+  return (1.0 * changes / blocks) > IMAGE_DIFF_THRESHOLD;
+}
+void takePictureMotionDetection();
+Task taskTakePictureMotionDetection(TASK_SECOND * 10, TASK_FOREVER, &takePictureMotionDetection);
+void takePictureMotionDetection() {
+
+  // Get new frame
+  camera_fb_t * frameBuffer = NULL;
+  frameBuffer = esp_camera_fb_get();
+  if(!frameBuffer) {
+    return;
+  }
+
+  // Scale down frame
+  scaleDown(frameBuffer->buf, currentFrame, BLOCK_SIZE);
+
+  // -> No motion detected
+  if (!motionDetected()) {
+    memcpy(previousFrame, currentFrame, DEST_WIDTH * DEST_HEIGHT);
+    return;
+  }
+
+  // -> Motion detected, stop task until frame has been evaluated
+  // taskTakePictureMotionDetection.disable();
+  Serial.println("taskTakePictureMotionDetection: Motion detected!");
+
+  fs::FS &fs = SD_MMC;
+  unsigned long nextPictureIndex = EEPROM.readULong(PICTURE_INDEX_ADDRESS);
+  EEPROM.writeULong(PICTURE_INDEX_ADDRESS, nextPictureIndex + 1);   // increment picture number in EEPROM
+  EEPROM.commit(); // EEPROM.end(); ???
+  
+  // Saving the picture to the sd card
+  String path = String(PICTURES_PATH) + "/" + String(mesh.getNodeId()).substring(7) + "_" + String(nextPictureIndex) + ".jpg";
+  File file = fs.open(path.c_str(), FILE_WRITE);
+  if(!file) {
+    Serial.println("taskTakePictureMotionDetection: Failed to open file in writing mode!");
+  } else {
+    file.write(frameBuffer->buf, frameBuffer->len);   // payload (image), payload length
+    Serial.printf("taskTakePictureMotionDetection: Saved picture to path: %s\n", path.c_str());
+  }
+  file.close();
+  
+  // Build the new report
+  PictureReportPackage newReport;
+  newReport.from = mesh.getNodeId();
+  newReport.dest = DEST_NODE;
+  newReport.pictureIndex = nextPictureIndex;
+  newReport.deerProbability = 0.5; // put tensorflow stuff here later
+
+  // Save Report to SD card
+  String newReportLogPath = String(REPORTS_PATH) + "/" + newReport.getFullReportName();
+  File newReportLog = fs.open(newReportLogPath, FILE_WRITE);
+  if (!newReportLog) {
+    Serial.printf("taskTakePictureMotionDetection: Could not create %s!\n", newReportLogPath.c_str());
+  } else {
+    // TODO: Use proper json objects
+    newReportLog.printf("Report about %s\n\n", newReport.getFullPictureName().c_str());
+    newReportLog.printf("from: %zu\n", newReport.from);
+    newReportLog.printf("dest: %zu\n", newReport.dest);
+    newReportLog.printf("pictureIndex: %lu\n", newReport.pictureIndex);
+    newReportLog.printf("deerProbability: %.2f\n", newReport.deerProbability);
+    newReportLog.close();
+
+    Serial.printf("taskTakePictureMotionDetection: Saved report to path: %s\n", newReportLogPath.c_str());
+  }
+
+  // Return if no deer was found
+  if (newReport.deerProbability < 0.5) {
+    Serial.printf("taskTakePictureMotionDetection: No deer found on %s.\n", newReport.getFullPictureName().c_str());
+    Serial.println("taskTakePictureMotionDetection: Report will not get pushed to queue.");
+    esp_camera_fb_return(frameBuffer);
+    return;
+  }
+
+  // Drop oldest report if queue is full and create error log.
+  if (reportQueue.isFull()) {
+    Serial.println("taskTakePictureMotionDetection: Queue is full.");
+
+    PictureReportPackage oldestReport;
+    reportQueue.pop(&oldestReport);
+    Serial.printf("taskTakePictureMotionDetection: Dropped the oldest report: %s\n", oldestReport.getFullReportName().c_str());
+    String newErrorLogPath = String(ERROR_LOGS_PATH) + "/" + oldestReport.getFullErrorName();
+    File newErrorLog = fs.open(newErrorLogPath.c_str(), FILE_WRITE);
+    if (!newErrorLog) {
+      Serial.printf("taskTakePictureMotionDetection: Could not create %s!\n", newErrorLogPath.c_str());
+    } else {
+      Serial.printf("taskTakePictureMotionDetection: Saved error log to path: %s\n", newErrorLogPath.c_str());
+      newErrorLog.close();
+    }
+  }
+
+  // Push new report to queue
+  reportQueue.push(&newReport);
+  Serial.println("taskTakePictureMotionDetection: Pushed report to queue.");
+
+  // Cleanup
+  esp_camera_fb_return(frameBuffer);
+  digitalWrite(GPIO_NUM_4, LOW);
+  memcpy(previousFrame, currentFrame, DEST_WIDTH * DEST_HEIGHT);
+  // taskTakePictureMotionDetection.enable();
+}
+
 void logUptime();
 Task taskLogUptime(TASK_MINUTE * 15, TASK_FOREVER, &logUptime);
 void logUptime() {
@@ -306,7 +479,7 @@ void initializeStorage() {
   }
   newUptimeLog.close();
 
-  taskTakePicture.enableIfNot();
+  taskTakePictureMotionDetection.enableIfNot();
   taskLogUptime.enableIfNot();
   taskInitializeStorage.disable();
 }
@@ -314,7 +487,9 @@ void initializeStorage() {
 void initializeCamera();
 Task taskInitializeCamera(TASK_SECOND * 30, TASK_ONCE, &initializeCamera);
 void initializeCamera() {
-  //pinMode(GPIO_NUM_4, INPUT);   // not needed?
+  pinMode(GPIO_NUM_4, OUTPUT);   // not needed?
+  digitalWrite(4, LOW);
+  rtc_gpio_hold_dis(GPIO_NUM_4);
   
   Serial.println("taskInitializeCamera: Configuring camera and picture properties.");
   camera_config_t config;
@@ -341,9 +516,9 @@ void initializeCamera() {
   
   // configuring picture properties
   if (psramFound()){
-    config.frame_size = FRAMESIZE_UXGA; // FRAMESIZE_ + QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA
+    config.frame_size = FRAMESIZE_XGA; // FRAMESIZE_ + QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA
     config.jpeg_quality = 10;
-    config.fb_count = 2;
+    config.fb_count = 1;
   } else {
     config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 12;
@@ -399,12 +574,12 @@ void setup() {
   // use this instead of adding more actions to setup() or loop()
   userScheduler.addTask(taskInitializeCamera);
   userScheduler.addTask(taskInitializeStorage);
-  userScheduler.addTask(taskTakePicture);
+  userScheduler.addTask(taskTakePictureMotionDetection);
   userScheduler.addTask(taskSendReport);
   userScheduler.addTask(taskLogUptime);
   
   // TODO: race conditions?
-  taskTakePicture.disable();
+  taskTakePictureMotionDetection.disable();
   taskLogUptime.disable();
   taskInitializeStorage.disable();
   taskInitializeCamera.enableIfNot();
