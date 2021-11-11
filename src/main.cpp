@@ -66,6 +66,7 @@
 #define   VSYNC_GPIO_NUM  25
 #define   HREF_GPIO_NUM   23
 #define   PCLK_GPIO_NUM   22
+#define   PIR_SENSOR_PIN  16
 
 #define   MESH_PREFIX     "SmartForestMesh"
 #define   MESH_PASSWORD   "SWORDFISH_4711"
@@ -137,7 +138,7 @@ uint8_t currentFrame[DEST_WIDTH * DEST_HEIGHT] = {0};
 
 /*  USER TASKS  */
 void sendReport();
-Task taskSendReport(TASK_SECOND * 60, TASK_FOREVER, &sendReport);
+Task taskSendReport(TASK_SECOND * 30, TASK_FOREVER, &sendReport);
 void sendReport() {
   if (reportQueue.isEmpty()) {
     Serial.println("taskSendReport: Queue is empty, nothing to send.");
@@ -146,6 +147,7 @@ void sendReport() {
   
   PictureReportPackage oldestReport;
   reportQueue.peek(&oldestReport);
+  Serial.printf("Json size: %zu\n", oldestReport.jsonObjectSize());
   if (mesh.sendPackage(&oldestReport)) {
     Serial.printf("taskSendReport: Transmission of report %s was successful.\n", oldestReport.getFullReportName().c_str());
     reportQueue.drop();
@@ -155,7 +157,7 @@ void sendReport() {
 }
 
 void takePicture();
-Task taskTakePicture(TASK_SECOND * 120, TASK_FOREVER, &takePicture);
+Task taskTakePicture(TASK_SECOND * 150, TASK_FOREVER, &takePicture);
 void takePicture() {
   Serial.println("taskTakePicture: Starting to take a picture.");
   fs::FS &fs = SD_MMC;
@@ -281,7 +283,6 @@ void scaleDown(uint8_t * sourceFrame, uint8_t destinationFrame[DEST_WIDTH*DEST_H
     offsetY += blockRowsOffset;
   }
 }
-
 bool motionDetected() {
   uint16_t changes = 0;
   const uint16_t blocks = DEST_WIDTH * DEST_HEIGHT;
@@ -402,6 +403,97 @@ void takePictureMotionDetection() {
   // taskTakePictureMotionDetection.enable();
 }
 
+void takePicturePIR();
+Task taskTakePicturePIR(TASK_SECOND * 15, TASK_FOREVER, &takePicturePIR);
+void takePicturePIR() {
+  // Return if no movement is being detected
+  if (digitalRead(PIR_SENSOR_PIN) == HIGH) {   // TODO: Check if HIGH or LOW
+    return;
+  }
+  
+  Serial.println("taskTakePicturePIR: Starting to take a picture.");
+  fs::FS &fs = SD_MMC;
+  unsigned long nextPictureIndex = EEPROM.readULong(PICTURE_INDEX_ADDRESS);
+  EEPROM.writeULong(PICTURE_INDEX_ADDRESS, nextPictureIndex + 1);   // increment picture number in EEPROM
+  EEPROM.commit(); // EEPROM.end(); ???
+
+  // Taking the picture
+  camera_fb_t * frameBuffer = NULL;
+  frameBuffer = esp_camera_fb_get();
+  if(!frameBuffer) {
+    Serial.println("taskTakePicturePIR: Camera capture failed!");
+    return;
+  }
+  
+  // Saving the picture to the sd card
+  String path = String(PICTURES_PATH) + "/" + String(mesh.getNodeId()).substring(7) + "_" + String(nextPictureIndex) + ".jpg";
+  File file = fs.open(path.c_str(), FILE_WRITE);
+  if(!file) {
+    Serial.println("taskTakePicturePIR: Failed to open file in writing mode!");
+  } else {
+    file.write(frameBuffer->buf, frameBuffer->len);   
+    Serial.printf("taskTakePicturePIR: Saved picture to path: %s\n", path.c_str());
+  }
+  file.close();
+  
+  // Build the new report
+  PictureReportPackage newReport;
+  newReport.from = mesh.getNodeId();
+  newReport.dest = DEST_NODE;
+  newReport.pictureIndex = nextPictureIndex;
+  newReport.deerProbability = 0.5; // put tensorflow stuff here later
+
+  // Save Report to SD card
+  String newReportLogPath = String(REPORTS_PATH) + "/" + newReport.getFullReportName();
+  File newReportLog = fs.open(newReportLogPath, FILE_WRITE);
+  if (!newReportLog) {
+    Serial.printf("taskTakePicturePIR: Could not create %s!\n", newReportLogPath.c_str());
+  } else {
+    // TODO: Use proper json objects
+    newReportLog.printf("Report about %s\n\n", newReport.getFullPictureName().c_str());
+    newReportLog.printf("from: %zu\n", newReport.from);
+    newReportLog.printf("dest: %zu\n", newReport.dest);
+    newReportLog.printf("pictureIndex: %lu\n", newReport.pictureIndex);
+    newReportLog.printf("deerProbability: %.2f\n", newReport.deerProbability);
+    newReportLog.close();
+
+    Serial.printf("taskTakePicture: Saved report to path: %s\n", newReportLogPath.c_str());
+  }
+
+  // Return if no deer was found
+  if (newReport.deerProbability < 0.5) {
+    Serial.printf("taskTakePicturePIR: No deer found on %s.\n", newReport.getFullPictureName().c_str());
+    Serial.println("taskTakePicturePIR: Report will not get pushed to queue.");
+    esp_camera_fb_return(frameBuffer);
+    return;
+  }
+
+  // Drop oldest report if queue is full and create error log.
+  if (reportQueue.isFull()) {
+    Serial.println("taskTakePicturePIR: Queue is full.");
+
+    PictureReportPackage oldestReport;
+    reportQueue.pop(&oldestReport);
+    Serial.printf("taskTakePicturePIR: Dropped the oldest report: %s\n", oldestReport.getFullReportName().c_str());
+    String newErrorLogPath = String(ERROR_LOGS_PATH) + "/" + oldestReport.getFullErrorName();
+    File newErrorLog = fs.open(newErrorLogPath.c_str(), FILE_WRITE);
+    if (!newErrorLog) {
+      Serial.printf("taskTakePicturePIR: Could not create %s!\n", newErrorLogPath.c_str());
+    } else {
+      Serial.printf("taskTakePicturePIR: Saved error log to path: %s\n", newErrorLogPath.c_str());
+      newErrorLog.close();
+    }
+  }
+
+  // Push new report to queue
+  reportQueue.push(&newReport);
+  Serial.println("taskTakePicture: Pushed report to queue.");
+
+  // Cleanup
+  esp_camera_fb_return(frameBuffer);
+  digitalWrite(GPIO_NUM_4, LOW);
+}
+
 void logUptime();
 Task taskLogUptime(TASK_MINUTE * 15, TASK_FOREVER, &logUptime);
 void logUptime() {
@@ -479,7 +571,7 @@ void initializeStorage() {
   }
   newUptimeLog.close();
 
-  taskTakePictureMotionDetection.enableIfNot();
+  taskTakePicture.enableIfNot();
   taskLogUptime.enableIfNot();
   taskInitializeStorage.disable();
 }
@@ -487,9 +579,14 @@ void initializeStorage() {
 void initializeCamera();
 Task taskInitializeCamera(TASK_SECOND * 30, TASK_ONCE, &initializeCamera);
 void initializeCamera() {
-  pinMode(GPIO_NUM_4, OUTPUT);   // not needed?
+  // GPIO 4 is soldered to SD card and LED flash
+  // This fixes current drops which causes SD problems
+  pinMode(GPIO_NUM_4, OUTPUT);   
   digitalWrite(4, LOW);
   rtc_gpio_hold_dis(GPIO_NUM_4);
+
+  // Prepare for readings from PIR sensor
+  pinMode(PIR_SENSOR_PIN, INPUT);
   
   Serial.println("taskInitializeCamera: Configuring camera and picture properties.");
   camera_config_t config;
@@ -574,12 +671,12 @@ void setup() {
   // use this instead of adding more actions to setup() or loop()
   userScheduler.addTask(taskInitializeCamera);
   userScheduler.addTask(taskInitializeStorage);
-  userScheduler.addTask(taskTakePictureMotionDetection);
+  userScheduler.addTask(taskTakePicture);
   userScheduler.addTask(taskSendReport);
   userScheduler.addTask(taskLogUptime);
   
   // TODO: race conditions?
-  taskTakePictureMotionDetection.disable();
+  taskTakePicture.disable();
   taskLogUptime.disable();
   taskInitializeStorage.disable();
   taskInitializeCamera.enableIfNot();
