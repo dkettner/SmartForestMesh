@@ -152,7 +152,7 @@ void takePicture() {
   EEPROM.writeULong(PICTURE_INDEX_ADDRESS, nextPictureIndex + 1);   // increment picture number in EEPROM
   EEPROM.commit(); // EEPROM.end(); ???
 
-  // Taking the picture
+  // Take the picture
   camera_fb_t * frameBuffer = NULL;
   frameBuffer = esp_camera_fb_get();
   if(!frameBuffer) {
@@ -160,7 +160,7 @@ void takePicture() {
     return;
   }
   
-  // Saving the picture to the sd card
+  // Save the picture to the sd card
   String path = String(PICTURES_PATH) + "/" + String(mesh.getNodeId()).substring(7) + "_" + String(nextPictureIndex) + ".jpg";
   File file = fs.open(path.c_str(), FILE_WRITE);
   if (!file) {
@@ -172,6 +172,7 @@ void takePicture() {
   file.close();
   
   // Build the new report
+  // TODO: put report handling in separate function
   PictureReportPackage newReport;
   newReport.from = mesh.getNodeId();
   newReport.dest = DEST_NODE;
@@ -321,7 +322,7 @@ void takePicturePIR() {
 }
 
 void logUptime();
-Task taskLogUptime(TASK_MINUTE * 15, TASK_FOREVER, &logUptime);
+Task taskLogUptime(TASK_MINUTE * 10, TASK_FOREVER, &logUptime);
 void logUptime() {
   fs::FS &fs = SD_MMC;
   File uptimeLog = fs.open(uptimeLogPath.c_str(), FILE_APPEND);
@@ -348,7 +349,7 @@ void resetEeprom(int range) {
 void initializeStorage();
 Task taskInitializeStorage(TASK_SECOND * 30, TASK_ONCE, &initializeStorage);
 void initializeStorage() {
-    // Initializing EEPROM
+  // Initializing EEPROM
   EEPROM.begin(EEPROM_SIZE);
   Serial.println("taskInitializeStorage: Initialized EEPROM.");
   // resetEeprom(EEPROM_SIZE); // uncomment if needed
@@ -381,13 +382,13 @@ void initializeStorage() {
     }
   }
 
-  // Creating new uptime log
+  // Creating new uptimeLogPath 
   unsigned long nextUptimeIndex = EEPROM.readULong(UPTIME_INDEX_ADDRESS);
   EEPROM.writeULong(UPTIME_INDEX_ADDRESS, nextUptimeIndex + 1);
   EEPROM.commit(); // EEPROM.end(); ?
-
   String newUptimelogPath = String(UPTIME_LOGS_PATH) + "/ut" + String(nextUptimeIndex) + ".log";
 
+  // Creating new uptimeLog (the actual file)
   File newUptimeLog = fs.open(newUptimelogPath.c_str(), FILE_WRITE);
   if(!newUptimeLog) {
     Serial.printf("taskInitializeStorage: Failed to create %s!\n", newUptimelogPath.c_str());
@@ -397,6 +398,7 @@ void initializeStorage() {
   }
   newUptimeLog.close();
 
+  // Next state
   taskTakePicture.enableIfNot();
   taskLogUptime.enableIfNot();
   taskInitializeStorage.disable();
@@ -441,7 +443,7 @@ void initializeCamera() {
   if (psramFound()){
     config.frame_size = FRAMESIZE_UXGA; // FRAMESIZE_ + QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA
     config.jpeg_quality = 10;
-    config.fb_count = 1;
+    config.fb_count = 1;  // = 2 was unstable and led to errors 
   } else {
     config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 12;
@@ -456,6 +458,8 @@ void initializeCamera() {
   }
 
   Serial.println("taskInitializeCamera: Finished configuration.");
+
+  // Next state
   taskInitializeStorage.enableIfNot();
   taskInitializeCamera.disable();
 }
@@ -474,7 +478,7 @@ void nodeTimeAdjustedCallback(int32_t offset) {
 }
 
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // disable brownout detector
   Serial.begin(115200);
 
   // starting the mesh
@@ -501,12 +505,12 @@ void setup() {
   userScheduler.addTask(taskSendReport);
   userScheduler.addTask(taskLogUptime);
   
-  // TODO: race conditions?
+  // Next state
   taskTakePicture.disable();
   taskLogUptime.disable();
   taskInitializeStorage.disable();
   taskInitializeCamera.enableIfNot();
-  taskSendReport.enableIfNot();
+  taskSendReport.enableIfNot();   // race conditions?
 }
 
 void loop() {
