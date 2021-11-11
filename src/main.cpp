@@ -28,17 +28,6 @@
 #include "soc/rtc_cntl_reg.h"  // Disable brownout problems
 #include "driver/rtc_io.h"
 
-// index handling with EEPROM
-#define   EEPROM_SIZE 8
-#define   PICTURE_INDEX_ADDRESS 0
-#define   UPTIME_INDEX_ADDRESS 4
-
-// directory paths
-#define   PICTURES_PATH     "/pictures"
-#define   REPORTS_PATH      "/reports"
-#define   UPTIME_LOGS_PATH  "/uptimeLogs"
-#define   ERROR_LOGS_PATH   "/errorLogs"
-
 // assign names to pin numbers
 #define   PWDN_GPIO_NUM   32
 #define   RESET_GPIO_NUM  -1
@@ -58,11 +47,22 @@
 #define   PCLK_GPIO_NUM   22
 #define   PIR_SENSOR_PIN  16
 
+// index handling with EEPROM
+#define   EEPROM_SIZE 8
+#define   PICTURE_INDEX_ADDRESS 0
+#define   UPTIME_INDEX_ADDRESS 4
+
+// directory paths
+#define   PICTURES_PATH     "/pictures"
+#define   REPORTS_PATH      "/reports"
+#define   UPTIME_LOGS_PATH  "/uptimeLogs"
+#define   ERROR_LOGS_PATH   "/errorLogs"
+
 // mesh network
-#define   DEST_NODE       3177562153        // Identify with mesh.getNodeId()
 #define   MESH_PREFIX     "SmartForestMesh"
 #define   MESH_PASSWORD   "SWORDFISH_4711"
 #define   MESH_PORT       5555
+#define   DEST_NODE       3177562153        // Identify with mesh.getNodeId()
 
 // custom package for transmission over the mesh network
 class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
