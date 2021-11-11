@@ -11,8 +11,6 @@
 #include <Arduino.h>
 #include <cppQueue.h>
 #include <painlessMesh.h>
-#include <painlessmesh/base64.hpp>
-#include "painlessmesh/plugin.hpp"
 
 #include <TensorFlowLite_ESP32.h>
 #include <tensorflow/lite/experimental/micro/kernels/micro_ops.h>
@@ -24,12 +22,13 @@
 
 #include <EEPROM.h>
 #include "esp_camera.h"
-#include "FS.h"                // SD Card ESP32
-#include "SD_MMC.h"            // SD Card ESP32
+#include "FS.h"
+#include "SD_MMC.h"
 #include "soc/soc.h"           // Disable brownout problems
 #include "soc/rtc_cntl_reg.h"  // Disable brownout problems
-#include "driver/rtc_io.h"     // not needed?
+#include "driver/rtc_io.h"
 
+// index handling with EEPROM
 #define   EEPROM_SIZE 8
 #define   PICTURE_INDEX_ADDRESS 0
 #define   UPTIME_INDEX_ADDRESS 4
@@ -59,14 +58,13 @@
 #define   PCLK_GPIO_NUM   22
 #define   PIR_SENSOR_PIN  16
 
+// mesh network
+#define   DEST_NODE       3177562153        // Identify with mesh.getNodeId()
 #define   MESH_PREFIX     "SmartForestMesh"
 #define   MESH_PASSWORD   "SWORDFISH_4711"
 #define   MESH_PORT       5555
 
-// Identify the destination node's ID with mesh.getNodeId()
-#define   DEST_NODE       3177562153
-
-// Custom package for transmission over the mesh network
+// custom package for transmission over the mesh network
 class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
  public:
   unsigned long pictureIndex;
@@ -100,7 +98,6 @@ class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
 
   }
 
-  // TODO: Refactor this
   String getFullPictureName() {
     return String(this->from % 1000) + "_" + String(pictureIndex) + ".jpg";
   }
@@ -127,7 +124,7 @@ String directories[] = {
 
 /*  USER TASKS  */
 void sendReport();
-Task taskSendReport(TASK_SECOND * 30, TASK_FOREVER, &sendReport);
+Task taskSendReport(TASK_SECOND * 60, TASK_FOREVER, &sendReport);
 void sendReport() {
   if (reportQueue.isEmpty()) {
     Serial.println("taskSendReport: Queue is empty, nothing to send.");
@@ -145,7 +142,7 @@ void sendReport() {
 }
 
 void takePicture();
-Task taskTakePicture(TASK_SECOND * 150, TASK_FOREVER, &takePicture);
+Task taskTakePicture(TASK_SECOND * 120, TASK_FOREVER, &takePicture);
 void takePicture() {
   Serial.println("taskTakePicture: Starting to take a picture.");
   fs::FS &fs = SD_MMC;
