@@ -48,9 +48,9 @@
 #define   PIR_SENSOR_PIN  16
 
 // index handling with EEPROM
-#define   EEPROM_SIZE 8
-#define   PICTURE_INDEX_ADDRESS 0
-#define   UPTIME_INDEX_ADDRESS 4
+#define   EEPROM_SIZE             8
+#define   PICTURE_INDEX_ADDRESS   0
+#define   UPTIME_INDEX_ADDRESS    4
 
 // directory paths
 #define   PICTURES_PATH     "/pictures"
@@ -59,10 +59,12 @@
 #define   ERROR_LOGS_PATH   "/errorLogs"
 
 // mesh network
-#define   MESH_PREFIX     "SmartForestMesh"
-#define   MESH_PASSWORD   "SWORDFISH_4711"
-#define   MESH_PORT       5555
-#define   DEST_NODE       3177562153        // Identify with mesh.getNodeId()
+#define   MESH_PREFIX       "SmartForestMesh"
+#define   MESH_PASSWORD     "SWORDFISH_4711"
+#define   MESH_PORT         5555
+#define   DEST_NODE         3177562153        // Identify with mesh.getNodeId()
+
+#define   QUEUE_SIZE        10
 
 // custom package for transmission over the mesh network
 class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
@@ -111,16 +113,16 @@ class PictureReportPackage : public painlessmesh::plugin::SinglePackage {
   }
 };
 
-Scheduler userScheduler; 
 painlessMesh mesh;
-cppQueue reportQueue(sizeof(PictureReportPackage), 10, FIFO);
-String uptimeLogPath;
+Scheduler userScheduler; 
+cppQueue reportQueue(sizeof(PictureReportPackage), QUEUE_SIZE, FIFO);
 String directories[] = {
   PICTURES_PATH,
   REPORTS_PATH,
   UPTIME_LOGS_PATH,
   ERROR_LOGS_PATH
 };
+String uptimeLogPath;
 
 /*  USER TASKS  */
 void sendReport();
